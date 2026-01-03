@@ -1,0 +1,21 @@
+[project]
+name = "pg-fts-learn"
+version = "0.1.0"
+description = "PostgreSQL Full Text Search Learning Project"
+requires-python = ">=3.10"
+dependencies = [
+    "alembic>=1.13.1",
+    "sqlalchemy>=2.0.25",
+    "psycopg2-binary>=2.9.9",
+    "faker>=22.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+]
