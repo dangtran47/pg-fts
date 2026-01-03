@@ -1,4 +1,4 @@
-.PHONY: help setup db-up db-down db-reset migrate seed clean install
+.PHONY: help setup db-up db-down db-reset migrate migrate-status migrate-history migrate-downgrade seed clean install
 
 # Default target
 help:
@@ -8,7 +8,10 @@ help:
 	@echo "  db-up      - Start PostgreSQL database with Docker"
 	@echo "  db-down    - Stop PostgreSQL database"
 	@echo "  db-reset   - Reset database (down, up, migrate, seed)"
-	@echo "  migrate    - Run Alembic migrations"
+	@echo "  migrate         - Run Alembic migrations"
+	@echo "  migrate-status  - Show current migration status"
+	@echo "  migrate-history - Show migration history"
+	@echo "  migrate-downgrade - Downgrade to previous migration"
 	@echo "  seed       - Seed database with test data"
 	@echo "  clean      - Remove virtual environment and Docker volumes"
 
@@ -50,6 +53,22 @@ migrate:
 	@echo "🔄 Running database migrations..."
 	source .venv/bin/activate && alembic upgrade head
 	@echo "✅ Migrations complete!"
+
+# Show current migration status
+migrate-status:
+	@echo "📊 Current migration status:"
+	source .venv/bin/activate && alembic current
+
+# Show migration history
+migrate-history:
+	@echo "📜 Migration history:"
+	source .venv/bin/activate && alembic history --verbose
+
+# Downgrade to previous migration
+migrate-downgrade:
+	@echo "⬇️  Downgrading to previous migration..."
+	source .venv/bin/activate && alembic downgrade -1
+	@echo "✅ Downgrade complete!"
 
 # Seed database with test data
 seed:
