@@ -1,4 +1,4 @@
-.PHONY: help setup db-up db-down db-reset migrate migrate-status migrate-history migrate-downgrade seed clean install
+.PHONY: help setup db-up db-down db-reset migrate migrate-status migrate-history migrate-downgrade seed clean install api api-dev
 
 # Default target
 help:
@@ -13,6 +13,8 @@ help:
 	@echo "  migrate-history - Show migration history"
 	@echo "  migrate-downgrade - Downgrade to previous migration"
 	@echo "  seed       - Seed database with test data"
+	@echo "  api        - Start search API server (production)"
+	@echo "  api-dev    - Start search API server (development with reload)"
 	@echo "  clean      - Remove virtual environment and Docker volumes"
 
 # Set up the project
@@ -75,6 +77,18 @@ seed:
 	@echo "🌱 Seeding database with test data..."
 	source .venv/bin/activate && python seed_data.py
 	@echo "✅ Database seeded!"
+
+# Start API server (production)
+api:
+	@echo "🚀 Starting search API server..."
+	source .venv/bin/activate && uvicorn search_api:app --host 0.0.0.0 --port 8000
+	@echo "✅ API server started!"
+
+# Start API server (development with reload)
+api-dev:
+	@echo "🚀 Starting search API server (development mode)..."
+	source .venv/bin/activate && uvicorn search_api:app --host 0.0.0.0 --port 8000 --reload
+	@echo "✅ API server started!"
 
 # Clean up project
 clean:
