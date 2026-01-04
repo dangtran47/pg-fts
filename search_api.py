@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from enum import Enum
 import os
+import json
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -42,6 +43,12 @@ class ResultType(str, Enum):
     column = "column"
 
 
+class MatchedColumn(BaseModel):
+    id: int
+    name: str
+    name_highlight: str
+
+
 class SearchResult(BaseModel):
     result_type: ResultType
     entity_id: int
@@ -60,6 +67,9 @@ class SearchResult(BaseModel):
     column_name: Optional[str] = None
     owner_id: Optional[int] = None
     owner_name: Optional[str] = None
+    
+    # For tables that match via their columns
+    matched_columns: Optional[List[MatchedColumn]] = None
 
 
 class SearchResponse(BaseModel):
@@ -144,172 +154,245 @@ async def search_catalog(
                 query=q
             )
         
-        results = []
-        
-        # Search schemas
-        schema_query = text("""
-            SELECT 
-                'schema' as result_type,
-                s.id as entity_id,
-                s.name,
-                s.description,
-                ts_headline('english', s.name, websearch_to_tsquery('english', :search_terms), 
-                    'StartSel=<mark>, StopSel=</mark>') as name_highlight,
-                ts_headline('english', COALESCE(s.description, ''), websearch_to_tsquery('english', :search_terms),
-                    'StartSel=<mark>, StopSel=</mark>, MaxFragments=3, MaxWords=50') as description_highlight,
-                -- Enhanced ranking: exact matches get higher score, name matches higher than description
-                (CASE 
-                    WHEN LOWER(s.name) = LOWER(:search_terms) THEN 10.0
-                    WHEN LOWER(s.name) LIKE LOWER('%' || :search_terms || '%') THEN 8.0 + ts_rank_cd(s.search_vector, websearch_to_tsquery('english', :search_terms))
-                    ELSE 5.0 + ts_rank_cd(s.search_vector, websearch_to_tsquery('english', :search_terms))
-                END) as rank,
-                s.id as schema_id,
-                s.name as schema_name,
-                NULL::integer as table_id,
-                NULL::text as table_name,
-                NULL::integer as column_id,
-                NULL::text as column_name,
-                NULL::integer as owner_id,
-                NULL::text as owner_name
-            FROM schemas s
-            WHERE s.search_vector @@ websearch_to_tsquery('english', :search_terms)
-        """)
-        
-        schema_results = db.execute(schema_query, {"search_terms": q}).fetchall()
-        results.extend(schema_results)
-        
-        # Search tables
-        table_query = text("""
-            SELECT 
-                'table' as result_type,
-                t.id as entity_id,
-                t.name,
-                t.description,
-                ts_headline('english', t.name, websearch_to_tsquery('english', :search_terms), 
-                    'StartSel=<mark>, StopSel=</mark>') as name_highlight,
-                ts_headline('english', COALESCE(t.description, ''), websearch_to_tsquery('english', :search_terms),
-                    'StartSel=<mark>, StopSel=</mark>, MaxFragments=3, MaxWords=50') as description_highlight,
-                -- Enhanced ranking: exact matches get higher score, name matches higher than description
-                (CASE 
-                    WHEN LOWER(t.name) = LOWER(:search_terms) THEN 9.0
-                    WHEN LOWER(t.name) LIKE LOWER('%' || :search_terms || '%') THEN 7.0 + ts_rank_cd(t.search_vector, websearch_to_tsquery('english', :search_terms))
-                    ELSE 4.0 + ts_rank_cd(t.search_vector, websearch_to_tsquery('english', :search_terms))
-                END) as rank,
-                s.id as schema_id,
-                s.name as schema_name,
-                t.id as table_id,
-                t.name as table_name,
-                NULL::integer as column_id,
-                NULL::text as column_name,
-                t.owner_id,
-                o.name as owner_name
-            FROM tables t
-            JOIN schemas s ON t.schema_id = s.id
-            LEFT JOIN owners o ON t.owner_id = o.id
-            WHERE t.search_vector @@ websearch_to_tsquery('english', :search_terms)
-                AND (:owner_id IS NULL OR t.owner_id = :owner_id)
-                AND (:schema_id IS NULL OR t.schema_id = :schema_id)
-        """)
-        
-        table_results = db.execute(table_query, {
-            "search_terms": q, 
-            "owner_id": owner_id, 
-            "schema_id": schema_id
-        }).fetchall()
-        results.extend(table_results)
-        
-        # Search columns
-        column_query = text("""
-            SELECT 
-                'column' as result_type,
-                c.id as entity_id,
-                c.name,
-                c.description,
-                ts_headline('english', c.name, websearch_to_tsquery('english', :search_terms), 
-                    'StartSel=<mark>, StopSel=</mark>') as name_highlight,
-                ts_headline('english', COALESCE(c.description, ''), websearch_to_tsquery('english', :search_terms),
-                    'StartSel=<mark>, StopSel=</mark>, MaxFragments=3, MaxWords=50') as description_highlight,
-                -- Enhanced ranking: exact matches get higher score, partial name matches, then description
-                (CASE 
-                    WHEN LOWER(c.name) = LOWER(:search_terms) THEN 8.0
-                    WHEN LOWER(c.name) LIKE LOWER(:search_terms || '%') THEN 6.5 + ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))
-                    WHEN LOWER(c.name) LIKE LOWER('%' || :search_terms || '%') THEN 6.0 + ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))
-                    ELSE 3.0 + ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))
-                END) as rank,
-                s.id as schema_id,
-                s.name as schema_name,
-                t.id as table_id,
-                t.name as table_name,
-                c.id as column_id,
-                c.name as column_name,
-                t.owner_id,
-                o.name as owner_name
-            FROM columns c
-            JOIN tables t ON c.table_id = t.id
-            JOIN schemas s ON t.schema_id = s.id
-            LEFT JOIN owners o ON t.owner_id = o.id
-            WHERE c.search_vector @@ websearch_to_tsquery('english', :search_terms)
-                AND (:owner_id IS NULL OR t.owner_id = :owner_id)
-                AND (:schema_id IS NULL OR t.schema_id = :schema_id)
-        """)
-        
-        column_results = db.execute(column_query, {
-            "search_terms": q, 
-            "owner_id": owner_id, 
-            "schema_id": schema_id
-        }).fetchall()
-        results.extend(column_results)
-        
-        # Add parent tables for column matches if requested
-        if include_parent_tables and column_results:
-            table_ids = {row.table_id for row in column_results}
-            existing_table_ids = {row.entity_id for row in table_results}
-            
-            # Get parent tables that aren't already in results
-            missing_table_ids = table_ids - existing_table_ids
-            
-            if missing_table_ids:
-                parent_table_query = text("""
-                    SELECT 
-                        'table' as result_type,
-                        t.id as entity_id,
-                        t.name,
-                        t.description,
-                        t.name as name_highlight,
-                        COALESCE(t.description, '') as description_highlight,
-                        0.5 as rank,  -- Lower rank for parent tables
-                        s.id as schema_id,
-                        s.name as schema_name,
-                        t.id as table_id,
-                        t.name as table_name,
-                        NULL::integer as column_id,
-                        NULL::text as column_name,
-                        t.owner_id,
-                        o.name as owner_name
-                    FROM tables t
-                    JOIN schemas s ON t.schema_id = s.id
-                    LEFT JOIN owners o ON t.owner_id = o.id
-                    WHERE t.id = ANY(:table_ids)
-                """)
+        # Single query with UNION ALL and database-level pagination
+        unified_query = text("""
+            WITH all_results AS (
+                -- Schema matches
+                SELECT 
+                    'schema' as result_type,
+                    s.id as entity_id,
+                    s.name,
+                    s.description,
+                    ts_headline('english', s.name, websearch_to_tsquery('english', :search_terms), 
+                        'StartSel=<mark>, StopSel=</mark>') as name_highlight,
+                    ts_headline('english', COALESCE(s.description, ''), websearch_to_tsquery('english', :search_terms),
+                        'StartSel=<mark>, StopSel=</mark>, MaxFragments=3, MaxWords=50') as description_highlight,
+                    -- Enhanced ranking: exact matches get higher score, name matches higher than description
+                    (CASE 
+                        WHEN LOWER(s.name) = LOWER(:search_terms) THEN 10.0
+                        WHEN LOWER(s.name) LIKE LOWER('%' || :search_terms || '%') THEN 8.0 + ts_rank_cd(s.search_vector, websearch_to_tsquery('english', :search_terms))
+                        ELSE 5.0 + ts_rank_cd(s.search_vector, websearch_to_tsquery('english', :search_terms))
+                    END) as rank,
+                    s.id as schema_id,
+                    s.name as schema_name,
+                    NULL::integer as table_id,
+                    NULL::text as table_name,
+                    NULL::integer as column_id,
+                    NULL::text as column_name,
+                    NULL::integer as owner_id,
+                    NULL::text as owner_name,
+                    NULL::json as matched_columns
+                FROM schemas s
+                WHERE s.search_vector @@ websearch_to_tsquery('english', :search_terms)
                 
-                parent_results = db.execute(parent_table_query, {
-                    "table_ids": list(missing_table_ids)
-                }).fetchall()
-                results.extend(parent_results)
+                UNION ALL
+                
+                -- Table matches (direct)
+                SELECT 
+                    'table' as result_type,
+                    t.id as entity_id,
+                    t.name,
+                    t.description,
+                    ts_headline('english', t.name, websearch_to_tsquery('english', :search_terms), 
+                        'StartSel=<mark>, StopSel=</mark>') as name_highlight,
+                    ts_headline('english', COALESCE(t.description, ''), websearch_to_tsquery('english', :search_terms),
+                        'StartSel=<mark>, StopSel=</mark>, MaxFragments=3, MaxWords=50') as description_highlight,
+                    -- Enhanced ranking: exact matches get higher score, name matches higher than description
+                    (CASE 
+                        WHEN LOWER(t.name) = LOWER(:search_terms) THEN 9.0
+                        WHEN LOWER(t.name) LIKE LOWER('%' || :search_terms || '%') THEN 7.0 + ts_rank_cd(t.search_vector, websearch_to_tsquery('english', :search_terms))
+                        ELSE 4.0 + ts_rank_cd(t.search_vector, websearch_to_tsquery('english', :search_terms))
+                    END) as rank,
+                    s.id as schema_id,
+                    s.name as schema_name,
+                    t.id as table_id,
+                    t.name as table_name,
+                    NULL::integer as column_id,
+                    NULL::text as column_name,
+                    t.owner_id,
+                    o.name as owner_name,
+                    NULL::json as matched_columns
+                FROM tables t
+                JOIN schemas s ON t.schema_id = s.id
+                LEFT JOIN owners o ON t.owner_id = o.id
+                WHERE t.search_vector @@ websearch_to_tsquery('english', :search_terms)
+                    AND (:owner_id IS NULL OR t.owner_id = :owner_id)
+                    AND (:schema_id IS NULL OR t.schema_id = :schema_id)
+                
+                UNION ALL
+                
+                -- Tables that match via their columns
+                SELECT 
+                    'table' as result_type,
+                    t.id as entity_id,
+                    t.name,
+                    t.description,
+                    t.name as name_highlight,  -- No highlight for table name since it matches via columns
+                    COALESCE(t.description, '') as description_highlight,
+                    -- Lower rank for indirect matches via columns
+                    5.5 + AVG(ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))) as rank,
+                    s.id as schema_id,
+                    s.name as schema_name,
+                    t.id as table_id,
+                    t.name as table_name,
+                    NULL::integer as column_id,
+                    NULL::text as column_name,
+                    t.owner_id,
+                    o.name as owner_name,
+                    -- Return JSON array of matching columns with IDs
+                    json_agg(
+                        json_build_object(
+                            'id', c.id,
+                            'name', c.name,
+                            'name_highlight', ts_headline('english', c.name, websearch_to_tsquery('english', :search_terms), 
+                                'StartSel=<mark>, StopSel=</mark>')
+                        ) ORDER BY ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms)) DESC
+                    ) as matched_columns
+                FROM tables t
+                JOIN schemas s ON t.schema_id = s.id
+                LEFT JOIN owners o ON t.owner_id = o.id
+                JOIN columns c ON c.table_id = t.id
+                WHERE c.search_vector @@ websearch_to_tsquery('english', :search_terms)
+                    AND (:owner_id IS NULL OR t.owner_id = :owner_id)
+                    AND (:schema_id IS NULL OR t.schema_id = :schema_id)
+                    -- Don't include tables that already match directly
+                    AND NOT t.search_vector @@ websearch_to_tsquery('english', :search_terms)
+                GROUP BY t.id, t.name, t.description, s.id, s.name, t.owner_id, o.name
+                
+                UNION ALL
+                
+                -- Column matches
+                SELECT 
+                    'column' as result_type,
+                    c.id as entity_id,
+                    c.name,
+                    c.description,
+                    ts_headline('english', c.name, websearch_to_tsquery('english', :search_terms), 
+                        'StartSel=<mark>, StopSel=</mark>') as name_highlight,
+                    ts_headline('english', COALESCE(c.description, ''), websearch_to_tsquery('english', :search_terms),
+                        'StartSel=<mark>, StopSel=</mark>, MaxFragments=3, MaxWords=50') as description_highlight,
+                    -- Enhanced ranking: exact matches get higher score, partial name matches, then description
+                    (CASE 
+                        WHEN LOWER(c.name) = LOWER(:search_terms) THEN 8.0
+                        WHEN LOWER(c.name) LIKE LOWER(:search_terms || '%') THEN 6.5 + ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))
+                        WHEN LOWER(c.name) LIKE LOWER('%' || :search_terms || '%') THEN 6.0 + ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))
+                        ELSE 3.0 + ts_rank_cd(c.search_vector, websearch_to_tsquery('english', :search_terms))
+                    END) as rank,
+                    s.id as schema_id,
+                    s.name as schema_name,
+                    t.id as table_id,
+                    t.name as table_name,
+                    c.id as column_id,
+                    c.name as column_name,
+                    t.owner_id,
+                    o.name as owner_name,
+                    NULL::json as matched_columns
+                FROM columns c
+                JOIN tables t ON c.table_id = t.id
+                JOIN schemas s ON t.schema_id = s.id
+                LEFT JOIN owners o ON t.owner_id = o.id
+                WHERE c.search_vector @@ websearch_to_tsquery('english', :search_terms)
+                    AND (:owner_id IS NULL OR t.owner_id = :owner_id)
+                    AND (:schema_id IS NULL OR t.schema_id = :schema_id)
+            ),
+            
+            -- Add parent tables for column matches if requested
+            with_parents AS (
+                SELECT * FROM all_results
+                
+                UNION ALL
+                
+                SELECT DISTINCT ON (t.id)
+                    'table' as result_type,
+                    t.id as entity_id,
+                    t.name,
+                    t.description,
+                    t.name as name_highlight,
+                    COALESCE(t.description, '') as description_highlight,
+                    0.5 as rank,  -- Lower rank for parent tables
+                    s.id as schema_id,
+                    s.name as schema_name,
+                    t.id as table_id,
+                    t.name as table_name,
+                    NULL::integer as column_id,
+                    NULL::text as column_name,
+                    t.owner_id,
+                    o.name as owner_name,
+                    NULL::json as matched_columns
+                FROM all_results ar
+                JOIN tables t ON ar.table_id = t.id
+                JOIN schemas s ON t.schema_id = s.id
+                LEFT JOIN owners o ON t.owner_id = o.id
+                WHERE ar.result_type = 'column'
+                  AND :include_parent_tables = true
+                  AND NOT EXISTS (
+                      SELECT 1 FROM all_results ar2 
+                      WHERE ar2.result_type = 'table' AND ar2.entity_id = t.id
+                  )
+            ),
+            
+            -- Get total count
+            counted AS (
+                SELECT *, COUNT(*) OVER() as total_count
+                FROM with_parents
+            ),
+            
+            -- Apply sorting and pagination at database level
+            paginated AS (
+                SELECT *
+                FROM counted
+                ORDER BY rank DESC, length(name) ASC, name ASC
+                LIMIT :page_size
+                OFFSET :offset
+            )
+            
+            SELECT * FROM paginated;
+        """)
         
-        # Sort by rank (primary) and name length (secondary) for better differentiation
-        results = sorted(results, key=lambda x: (x.rank, -len(x.name), x.name), reverse=True)
+        # Calculate offset
+        offset = (page - 1) * page_size
         
-        # Apply pagination
-        total_count = len(results)
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_results = results[start_idx:end_idx]
+        # Execute the unified query
+        results = db.execute(unified_query, {
+            "search_terms": q,
+            "owner_id": owner_id,
+            "schema_id": schema_id,
+            "include_parent_tables": include_parent_tables,
+            "page_size": page_size,
+            "offset": offset
+        }).fetchall()
         
-        total_pages = (total_count + page_size - 1) // page_size
+        if not results:
+            total_count = 0
+            total_pages = 0
+        else:
+            total_count = results[0].total_count
+            total_pages = (total_count + page_size - 1) // page_size
         
-        search_results = [
-            SearchResult(
+        search_results = []
+        for row in results:
+            # Parse matched_columns from JSON if it exists
+            matched_columns = None
+            if row.matched_columns:
+                try:
+                    if isinstance(row.matched_columns, str):
+                        matched_columns_data = json.loads(row.matched_columns)
+                    else:
+                        matched_columns_data = row.matched_columns
+                    
+                    matched_columns = [
+                        MatchedColumn(
+                            id=col["id"],
+                            name=col["name"],
+                            name_highlight=col["name_highlight"]
+                        )
+                        for col in matched_columns_data
+                    ]
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    # If JSON parsing fails, set to None
+                    matched_columns = None
+            
+            search_results.append(SearchResult(
                 result_type=row.result_type,
                 entity_id=row.entity_id,
                 name=row.name,
@@ -324,10 +407,9 @@ async def search_catalog(
                 column_id=row.column_id,
                 column_name=row.column_name,
                 owner_id=row.owner_id,
-                owner_name=row.owner_name
-            )
-            for row in paginated_results
-        ]
+                owner_name=row.owner_name,
+                matched_columns=matched_columns
+            ))
         
         return SearchResponse(
             results=search_results,
